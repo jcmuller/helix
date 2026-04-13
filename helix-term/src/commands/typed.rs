@@ -2726,7 +2726,8 @@ fn reset_diff_change(
     let scrolloff = cx.editor.config().scrolloff;
     let view_id = cx.editor.tree.focus;
 
-    let session_info = cx.editor
+    let session_info = cx
+        .editor
         .diff_sessions
         .iter()
         .find(|s| s.contains_view(view_id))
@@ -2815,18 +2816,15 @@ fn reset_diff_change(
     Ok(())
 }
 
-fn diff_put(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_put(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
     let view_id = cx.editor.tree.focus;
 
-    let session_info = cx.editor
+    let session_info = cx
+        .editor
         .diff_sessions
         .iter()
         .find(|s| s.contains_view(view_id))
@@ -2837,7 +2835,13 @@ fn diff_put(
                 helix_view::diff_session::DiffSide::B => (s.doc_b(), s.doc_a()),
             };
             let partner_view_id = s.partner_view(view_id)?;
-            Some((s.hunks_arc(), side, doc_curr_id, doc_partner_id, partner_view_id))
+            Some((
+                s.hunks_arc(),
+                side,
+                doc_curr_id,
+                doc_partner_id,
+                partner_view_id,
+            ))
         });
 
     let Some((hunks, side, doc_curr_id, doc_partner_id, partner_view_id)) = session_info else {
@@ -2878,11 +2882,7 @@ fn diff_put(
     Ok(())
 }
 
-fn diff_off(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_off(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -2903,11 +2903,7 @@ fn diff_off(
     Ok(())
 }
 
-fn diff_this(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn diff_this(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -2921,11 +2917,13 @@ fn diff_this(
     match cx.editor.pending_diff_this {
         None => {
             cx.editor.pending_diff_this = Some(view_id);
-            cx.editor.set_status("Diff: marked first view. Run :diffthis in the second view.");
+            cx.editor
+                .set_status("Diff: marked first view. Run :diffthis in the second view.");
         }
         Some(other_view_id) if other_view_id == view_id => {
             cx.editor.pending_diff_this = None;
-            cx.editor.set_status("Diff: cancelled (same view selected twice).");
+            cx.editor
+                .set_status("Diff: cancelled (same view selected twice).");
         }
         Some(other_view_id) => {
             cx.editor.pending_diff_this = None;
