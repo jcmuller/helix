@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
 
@@ -14,8 +13,11 @@ use helix_stdx::path::home_dir;
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ConfigEvent};
 use helix_view::expansion;
+use helix_view::handlers::BlameEvent;
 use serde_json::Value;
 use ui::completers::{self, Completer};
+
+use std::fmt::Write;
 
 #[derive(Clone)]
 pub struct TypableCommand {
@@ -39,21 +41,21 @@ pub struct CommandCompleter {
 }
 
 impl CommandCompleter {
-    const fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             positional_args: &[],
             var_args: completers::none,
         }
     }
 
-    const fn positional(completers: &'static [Completer]) -> Self {
+    pub const fn positional(completers: &'static [Completer]) -> Self {
         Self {
             positional_args: completers,
             var_args: completers::none,
         }
     }
 
-    const fn all(completer: Completer) -> Self {
+    pub const fn all(completer: Completer) -> Self {
         Self {
             positional_args: &[],
             var_args: completer,
@@ -80,7 +82,6 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             WriteOptions {
                 force: false,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?;
     }
@@ -100,7 +101,6 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
             WriteOptions {
                 force: true,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?;
     }
@@ -383,76 +383,42 @@ fn write_impl(
     options: WriteOptions,
 ) -> anyhow::Result<()> {
     let config = cx.editor.config();
+    let jobs = &mut cx.jobs;
     let (view, doc) = current!(cx.editor);
-    let doc_id = doc.id();
-    let view_id = view.id;
 
     if doc.trim_trailing_whitespace() {
-        trim_trailing_whitespace(doc, view_id);
+        trim_trailing_whitespace(doc, view.id);
     }
     if config.trim_final_newlines {
-        trim_final_newlines(doc, view_id);
+        trim_final_newlines(doc, view.id);
     }
     if doc.insert_final_newline() {
-        insert_final_newline(doc, view_id);
+        insert_final_newline(doc, view.id);
     }
 
     // Save an undo checkpoint for any outstanding changes.
     doc.append_changes_to_history(view);
 
-    let auto_format = config.auto_format && options.auto_format;
-    let force = options.force;
-    let path: Option<PathBuf> = path.map(Into::into);
+    let (view, doc) = current_ref!(cx.editor);
+    let fmt = if config.auto_format && options.auto_format {
+        doc.auto_format(cx.editor).map(|fmt| {
+            let callback = make_format_callback(
+                doc.id(),
+                doc.version(),
+                view.id,
+                fmt,
+                Some((path.map(Into::into), options.force)),
+            );
 
-    // Does the document configure any code actions to run on save?
-    let run_code_actions = options.code_actions
-        && doc!(cx.editor, &doc_id)
-            .language_config()
-            .and_then(|c| c.code_actions_on_save.as_deref())
-            .is_some_and(|kinds| !kinds.is_empty());
-
-    // The tail of the on-save chain: re-build the auto-format job against the
-    // latest document (so it formats after any code-action edits), or save
-    // directly when there's no formatter. Deferred via `Followup`, and always
-    // saves, so code-actions-on-save works even with auto-format off. Only
-    // built when there is pre-save work. A plain `:w` saves synchronously below.
-    let tail = (auto_format || run_code_actions).then(|| {
-        let path = path.clone();
-        let callback = Callback::Followup(Box::new(move |editor| {
-            let doc = doc!(editor, &doc_id);
-            let fmt_job = auto_format
-                .then(|| doc.auto_format(editor))
-                .flatten()
-                .map(|fmt| {
-                    let call = make_format_callback(
-                        doc_id,
-                        doc.version(),
-                        view_id,
-                        fmt,
-                        Some((path.clone(), force)),
-                    );
-                    Job::with_callback(call).wait_before_exiting()
-                });
-            if fmt_job.is_none() {
-                if let Err(err) = editor.save(doc_id, path, force) {
-                    editor.set_error(format!("Error saving: {}", err));
-                }
-            }
-            fmt_job
-        }));
-        Job::with_callback(async { Ok(callback) }).wait_before_exiting()
-    });
-
-    let job = if run_code_actions {
-        code_actions_on_save(cx, doc_id, tail)
+            jobs.add(Job::with_callback(callback).wait_before_exiting());
+        })
     } else {
-        tail
+        None
     };
 
-    if let Some(job) = job {
-        cx.jobs.add(job);
-    } else {
-        cx.editor.save(doc_id, path, force)?;
+    if fmt.is_none() {
+        let id = doc.id();
+        cx.editor.save(id, path, options.force)?;
     }
 
     Ok(())
@@ -521,7 +487,6 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
 pub struct WriteOptions {
     pub force: bool,
     pub auto_format: bool,
-    pub code_actions: bool,
 }
 
 fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -535,7 +500,6 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         WriteOptions {
             force: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -551,7 +515,6 @@ fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         WriteOptions {
             force: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -571,7 +534,6 @@ fn write_buffer_close(
         WriteOptions {
             force: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -594,7 +556,6 @@ fn force_write_buffer_close(
         WriteOptions {
             force: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -783,7 +744,6 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         WriteOptions {
             force: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     cx.block_try_flush_writes()?;
@@ -805,7 +765,6 @@ fn force_write_quit(
         WriteOptions {
             force: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     cx.block_try_flush_writes()?;
@@ -819,6 +778,8 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
     let modified_ids: Vec<_> = editor
         .documents()
         .filter(|doc| doc.is_modified())
+        // Named scratch documents should not be included here
+        .filter(|doc| doc.name.is_none())
         .map(|doc| doc.id())
         .collect();
 
@@ -850,7 +811,6 @@ pub struct WriteAllOptions {
     pub force: bool,
     pub write_scratch: bool,
     pub auto_format: bool,
-    pub code_actions: bool,
 }
 
 pub fn write_all_impl(
@@ -859,6 +819,7 @@ pub fn write_all_impl(
 ) -> anyhow::Result<()> {
     let mut errors: Vec<&'static str> = Vec::new();
     let config = cx.editor.config();
+    let jobs = &mut cx.jobs;
     let saves: Vec<_> = cx
         .editor
         .documents
@@ -871,7 +832,13 @@ pub fn write_all_impl(
             if !doc.is_modified() {
                 return None;
             }
-            if doc.path().is_none() {
+
+            // This is a named buffer. We'll skip it in the saves for now
+            if doc.name.is_some() {
+                return None;
+            }
+
+            if doc.path().is_none() && doc.name.is_none() {
                 if options.write_scratch {
                     errors.push("cannot write a buffer without a filename");
                 }
@@ -901,53 +868,24 @@ pub fn write_all_impl(
         // Save an undo checkpoint for any outstanding changes.
         doc.append_changes_to_history(view);
 
-        let auto_format = config.auto_format && options.auto_format;
-        let force = options.force;
-
-        let run_code_actions = options.code_actions
-            && doc!(cx.editor, &doc_id)
-                .language_config()
-                .and_then(|c| c.code_actions_on_save.as_deref())
-                .is_some_and(|kinds| !kinds.is_empty());
-
-        // See `write_impl`: deferred format-or-save tail that always saves, only
-        // built when there is pre-save work; otherwise a synchronous save below.
-        let tail = (auto_format || run_code_actions).then(|| {
-            let callback: job::Callback = Callback::Followup(Box::new(move |editor| {
-                let doc = doc!(editor, &doc_id);
-                let fmt_job = auto_format
-                    .then(|| doc.auto_format(editor))
-                    .flatten()
-                    .map(|fmt| {
-                        let call = make_format_callback(
-                            doc_id,
-                            doc.version(),
-                            target_view,
-                            fmt,
-                            Some((None, force)),
-                        );
-                        Job::with_callback(call).wait_before_exiting()
-                    });
-                if fmt_job.is_none() {
-                    if let Err(err) = editor.save::<PathBuf>(doc_id, None, force) {
-                        editor.set_error(format!("Error saving: {}", err));
-                    }
-                }
-                fmt_job
-            }));
-            Job::with_callback(async { Ok(callback) }).wait_before_exiting()
-        });
-
-        let job = if run_code_actions {
-            code_actions_on_save(cx, doc_id, tail)
+        let fmt = if options.auto_format && config.auto_format {
+            let doc = doc!(cx.editor, &doc_id);
+            doc.auto_format(cx.editor).map(|fmt| {
+                let callback = make_format_callback(
+                    doc_id,
+                    doc.version(),
+                    target_view,
+                    fmt,
+                    Some((None, options.force)),
+                );
+                jobs.add(Job::with_callback(callback).wait_before_exiting());
+            })
         } else {
-            tail
+            None
         };
 
-        if let Some(job) = job {
-            cx.jobs.add(job);
-        } else {
-            cx.editor.save::<PathBuf>(doc_id, None, force)?;
+        if fmt.is_none() {
+            cx.editor.save::<PathBuf>(doc_id, None, options.force)?;
         }
     }
 
@@ -969,7 +907,6 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
             force: false,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -989,7 +926,6 @@ fn force_write_all(
             force: true,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -1008,7 +944,6 @@ fn write_all_quit(
             force: false,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, false)
@@ -1028,7 +963,6 @@ fn force_write_all_quit(
             force: true,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     );
     quit_all_impl(cx, true)
@@ -1122,7 +1056,8 @@ fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
                     .editor
                     .theme_loader
                     .load(theme_name)
-                    .map_err(|err| anyhow::anyhow!("Could not load theme: {}", err))?;
+                    .map_err(|err| anyhow::anyhow!("could not load theme: {}", err))?;
+
                 if !(true_color || theme.is_16_color()) {
                     bail!("Unsupported theme: theme requires true color support");
                 }
@@ -1583,18 +1518,33 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let trust_full = doc_trust_full(cx.editor);
+    let auto_fetch = cx.editor.config().inline_blame.auto_fetch;
     let (view, doc) = current!(cx.editor);
-    doc.reload(view, &cx.editor.diff_providers, trust_full)
-        .map(|_| {
-            view.ensure_cursor_in_view(doc, scrolloff);
-        })?;
+    doc.reload(view, &mut cx.editor.diff_providers).map(|_| {
+        view.ensure_cursor_in_view(doc, scrolloff);
+    })?;
+    let doc_id = doc.id();
     if let Some(path) = doc.path().map(ToOwned::to_owned) {
         cx.editor
             .language_servers
             .file_event_handler
             .file_changed(path);
     }
+
+    if doc.should_request_full_file_blame(auto_fetch) {
+        if let Some(path) = doc.path() {
+            helix_event::send_blocking(
+                &cx.editor.handlers.blame,
+                BlameEvent {
+                    path: path.to_path_buf(),
+                    doc_id,
+                    line: None,
+                },
+            );
+        }
+    }
+    doc.is_blame_potentially_out_of_date = true;
+
     Ok(())
 }
 
@@ -1621,6 +1571,9 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         })
         .collect();
 
+    let blame_compute = cx.editor.config().inline_blame.auto_fetch;
+    cx.editor.diff_providers.reset();
+
     for (doc_id, view_ids) in docs_view_ids {
         let doc = doc_mut!(cx.editor, &doc_id);
 
@@ -1630,16 +1583,7 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        // Per-document trust: each doc's workspace may differ.
-        let trust_full = cx
-            .editor
-            .workspace_trust
-            .query(
-                doc.workspace_root(),
-                helix_loader::workspace_trust::TrustQuery::Git,
-            )
-            .is_trusted();
-        if let Err(error) = doc.reload(view, &cx.editor.diff_providers, trust_full) {
+        if let Err(error) = doc.reload(view, &mut cx.editor.diff_providers) {
             cx.editor.set_error(format!("{}", error));
             continue;
         }
@@ -1664,6 +1608,20 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
                 view.ensure_cursor_in_view(doc, scrolloff);
             }
         }
+
+        if doc.should_request_full_file_blame(blame_compute) {
+            if let Some(path) = doc.path() {
+                helix_event::send_blocking(
+                    &cx.editor.handlers.blame,
+                    BlameEvent {
+                        path: path.to_path_buf(),
+                        doc_id,
+                        line: None,
+                    },
+                );
+            }
+        }
+        doc.is_blame_potentially_out_of_date = true;
     }
 
     Ok(())
@@ -1683,7 +1641,6 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
             WriteOptions {
                 force: false,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
-                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )
     } else {
@@ -2677,6 +2634,55 @@ fn run_shell_command(
     Ok(())
 }
 
+fn diff_open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let args: Vec<_> = args.into_iter().collect();
+    if args.len() != 2 {
+        bail!("Expected exactly 2 file paths: :diff-open file1 file2");
+    }
+
+    let (path_a, pos_a) = crate::args::parse_file(&args[0]);
+    let (path_b, pos_b) = crate::args::parse_file(&args[1]);
+    let path_a = helix_stdx::path::expand_tilde(path_a);
+    let path_b = helix_stdx::path::expand_tilde(path_b);
+
+    let doc_a = cx.editor.open(&path_a, Action::Replace)?;
+    let view_a = cx.editor.tree.focus;
+    {
+        let (view, doc) = current!(cx.editor);
+        let sel = Selection::point(pos_at_coords(doc.text().slice(..), pos_a, true));
+        doc.set_selection(view.id, sel);
+        align_view(doc, view, Align::Center);
+    }
+
+    let doc_b = cx.editor.open(&path_b, Action::VerticalSplit)?;
+    let view_b = cx.editor.tree.focus;
+    {
+        let (view, doc) = current!(cx.editor);
+        let sel = Selection::point(pos_at_coords(doc.text().slice(..), pos_b, true));
+        doc.set_selection(view.id, sel);
+        align_view(doc, view, Align::Center);
+    }
+
+    let rope_a = cx.editor.documents[&doc_a].text().clone();
+    let rope_b = cx.editor.documents[&doc_b].text().clone();
+
+    let mut session = helix_view::diff_session::DiffSession::new(view_a, view_b, doc_a, doc_b);
+    session.compute_hunks(&rope_a, &rope_b);
+
+    cx.editor.diff_sessions.push(session);
+    cx.editor.set_status(format!(
+        "Diff: {} vs {}",
+        path_a.display(),
+        path_b.display()
+    ));
+
+    Ok(())
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -2686,9 +2692,59 @@ fn reset_diff_change(
         return Ok(());
     }
 
-    let editor = &mut cx.editor;
-    let scrolloff = editor.config().scrolloff;
+    let scrolloff = cx.editor.config().scrolloff;
+    let view_id = cx.editor.tree.focus;
 
+    let session_info = cx
+        .editor
+        .diff_sessions
+        .iter()
+        .find(|s| s.contains_view(view_id))
+        .and_then(|s| {
+            let side = s.side_for_view(view_id)?;
+            let (doc_curr_id, doc_partner_id) = match side {
+                helix_view::diff_session::DiffSide::A => (s.doc_a(), s.doc_b()),
+                helix_view::diff_session::DiffSide::B => (s.doc_b(), s.doc_a()),
+            };
+            Some((s.hunks_arc(), side, doc_curr_id, doc_partner_id))
+        });
+
+    if let Some((hunks, side, doc_curr_id, doc_partner_id)) = session_info {
+        let curr_text = cx.editor.documents[&doc_curr_id].text().clone();
+        let partner_text = cx.editor.documents[&doc_partner_id].text().clone();
+        let line_ranges: Vec<(usize, usize)> = {
+            let doc = &cx.editor.documents[&doc_curr_id];
+            doc.selection(view_id)
+                .line_ranges(curr_text.slice(..))
+                .collect()
+        };
+
+        let (transaction, changes) = helix_view::diff_session::build_get_transaction(
+            &hunks,
+            side,
+            &line_ranges,
+            &curr_text,
+            &partner_text,
+        );
+
+        if changes == 0 {
+            bail!("No diff hunks under selection");
+        }
+
+        {
+            let view = cx.editor.tree.get_mut(view_id);
+            let doc = cx.editor.documents.get_mut(&doc_curr_id).unwrap();
+            doc.apply(&transaction, view_id);
+            doc.append_changes_to_history(view);
+            view.ensure_cursor_in_view(doc, scrolloff);
+        }
+        cx.editor.set_status(format!(
+            "Got {changes} change{}",
+            if changes == 1 { "" } else { "s" }
+        ));
+        return Ok(());
+    }
+    let editor = &mut cx.editor;
     let (view, doc) = current!(editor);
     let Some(handle) = doc.diff_handle() else {
         bail!("Diff is not available in the current buffer")
@@ -2726,6 +2782,139 @@ fn reset_diff_change(
         "Reset {changes} change{}",
         if changes == 1 { "" } else { "s" }
     ));
+    Ok(())
+}
+
+fn diff_put(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let view_id = cx.editor.tree.focus;
+
+    let session_info = cx
+        .editor
+        .diff_sessions
+        .iter()
+        .find(|s| s.contains_view(view_id))
+        .and_then(|s| {
+            let side = s.side_for_view(view_id)?;
+            let (doc_curr_id, doc_partner_id) = match side {
+                helix_view::diff_session::DiffSide::A => (s.doc_a(), s.doc_b()),
+                helix_view::diff_session::DiffSide::B => (s.doc_b(), s.doc_a()),
+            };
+            let partner_view_id = s.partner_view(view_id)?;
+            Some((
+                s.hunks_arc(),
+                side,
+                doc_curr_id,
+                doc_partner_id,
+                partner_view_id,
+            ))
+        });
+
+    let Some((hunks, side, doc_curr_id, doc_partner_id, partner_view_id)) = session_info else {
+        bail!("Not in a diff session");
+    };
+
+    let curr_text = cx.editor.documents[&doc_curr_id].text().clone();
+    let partner_text = cx.editor.documents[&doc_partner_id].text().clone();
+    let line_ranges: Vec<(usize, usize)> = {
+        let doc = &cx.editor.documents[&doc_curr_id];
+        doc.selection(view_id)
+            .line_ranges(curr_text.slice(..))
+            .collect()
+    };
+
+    let (transaction, changes) = helix_view::diff_session::build_put_transaction(
+        &hunks,
+        side,
+        &line_ranges,
+        &curr_text,
+        &partner_text,
+    );
+
+    if changes == 0 {
+        bail!("No diff hunks under selection");
+    }
+
+    {
+        let view = cx.editor.tree.get_mut(partner_view_id);
+        let doc = cx.editor.documents.get_mut(&doc_partner_id).unwrap();
+        doc.apply(&transaction, partner_view_id);
+        doc.append_changes_to_history(view);
+    }
+    cx.editor.set_status(format!(
+        "Put {changes} change{}",
+        if changes == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+fn diff_off(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let view_id = cx.editor.tree.focus;
+    let idx = cx
+        .editor
+        .diff_sessions
+        .iter()
+        .position(|s| s.contains_view(view_id));
+
+    let Some(idx) = idx else {
+        bail!("Not in a diff session");
+    };
+
+    cx.editor.diff_sessions.remove(idx);
+    cx.editor.set_status("Diff session ended");
+    Ok(())
+}
+
+fn diff_this(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let view_id = cx.editor.tree.focus;
+
+    if cx.editor.diff_session_for(view_id).is_some() {
+        bail!("This view is already part of a diff session. Use :diff-off first.");
+    }
+
+    match cx.editor.pending_diff_this {
+        None => {
+            cx.editor.pending_diff_this = Some(view_id);
+            cx.editor
+                .set_status("Diff: marked first view. Run :diffthis in the second view.");
+        }
+        Some(other_view_id) if other_view_id == view_id => {
+            cx.editor.pending_diff_this = None;
+            cx.editor
+                .set_status("Diff: cancelled (same view selected twice).");
+        }
+        Some(other_view_id) => {
+            cx.editor.pending_diff_this = None;
+
+            let other_doc_id = cx.editor.tree.get(other_view_id).doc;
+            let this_doc_id = cx.editor.tree.get(view_id).doc;
+
+            let rope_a = cx.editor.documents[&other_doc_id].text().clone();
+            let rope_b = cx.editor.documents[&this_doc_id].text().clone();
+
+            let mut session = helix_view::diff_session::DiffSession::new(
+                other_view_id,
+                view_id,
+                other_doc_id,
+                this_doc_id,
+            );
+            session.compute_hunks(&rope_a, &rope_b);
+            cx.editor.diff_sessions.push(session);
+            cx.editor.set_status("Diff session started.");
+        }
+    }
+
     Ok(())
 }
 
@@ -2989,12 +3178,6 @@ const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
-const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
-    name: "no-code-actions",
-    doc: "skip code actions on save",
-    ..Flag::DEFAULT
-};
-
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
@@ -3004,7 +3187,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3016,7 +3199,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3143,7 +3326,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3155,7 +3338,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG,WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3167,7 +3350,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG,WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3179,7 +3362,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG,WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3260,7 +3443,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3272,7 +3455,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3284,7 +3467,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3296,7 +3479,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3308,7 +3491,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3320,7 +3503,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -3967,10 +4150,54 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: SHELL_SIGNATURE,
     },
     TypableCommand {
+        name: "diff-open",
+        aliases: &["diffs"],
+        doc: "Open two files side-by-side in diff mode with aligned hunks. Each path accepts a file:line or file:line:col suffix.",
+        fun: diff_open,
+        completer: CommandCompleter::positional(&[completers::filename, completers::filename]),
+        signature: Signature {
+            positionals: (2, Some(2)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "reset-diff-change",
         aliases: &["diffget", "diffg"],
-        doc: "Reset the diff change at the cursor position.",
+        doc: "In a diff session: pull changes from the partner buffer. Outside a diff session: reset the diff change at the cursor position to the VCS base.",
         fun: reset_diff_change,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-put",
+        aliases: &["diffput", "diffp"],
+        doc: "In a diff session: push changes from the current buffer to the partner buffer at the cursor position.",
+        fun: diff_put,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-off",
+        aliases: &["diffoff"],
+        doc: "End the diff session for the current view. Both views continue as independent buffers.",
+        fun: diff_off,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "diff-this",
+        aliases: &["diffthis"],
+        doc: "Mark the current view as a diff participant. Run in two views to create a diff session between them.",
+        fun: diff_this,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -4080,7 +4307,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "workspace-trust",
         aliases: &[],
-        doc: "Allow language servers and local config for the current workspace.",
+        doc: "Add current workspace to the list of trusted workspaces.",
         fun: trust_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
@@ -4088,16 +4315,8 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "workspace-untrust",
         aliases: &[],
-        doc: "Revoke the current workspace's trust grant or exclusion.",
+        doc: "Remove current workspace from the list of trusted workspaces.",
         fun: untrust_workspace,
-        completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    },
-    TypableCommand {
-        name: "workspace-exclude",
-        aliases: &[],
-        doc: "Mark the current workspace as never-prompt. Never prompts for trust again.",
-        fun: exclude_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
     }
@@ -4130,10 +4349,40 @@ fn execute_command_line(
         return execute_command(cx, cmd, command, event);
     }
 
-    match typed::TYPABLE_COMMAND_MAP.get(command) {
-        Some(cmd) => execute_command(cx, cmd, rest, event),
-        None if event == PromptEvent::Validate => Err(anyhow!("no such command: '{command}'")),
-        None => Ok(()),
+    if event == PromptEvent::Validate {
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        if ScriptingEngine::call_typed_command(cx, command, &parts, event) {
+            // Engine handles the other cases
+            let mappable_command = MappableCommand::Typable {
+                name: command.to_string(),
+                args: parts.join(" "),
+                doc: "".to_string(),
+            };
+
+            let mut ctx = Context {
+                register: None,
+                count: None,
+                editor: cx.editor,
+                callback: Vec::new(),
+                on_next_key_callback: None,
+                jobs: cx.jobs,
+            };
+
+            helix_event::dispatch(crate::events::PostCommand {
+                command: &mappable_command,
+                cx: &mut ctx,
+            });
+
+            Ok(())
+        } else if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(command) {
+            execute_command(cx, cmd, rest, event)
+        } else {
+            Err(anyhow!("1 no such command: '{command}'"))
+        }
+    } else if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(command) {
+        execute_command(cx, cmd, rest, event)
+    } else {
+        Ok(())
     }
 }
 
@@ -4153,7 +4402,30 @@ pub(super) fn execute_command(
             .expect("arg parsing cannot fail when validation is turned off")
     };
 
-    (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))
+    let res = (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name));
+
+    let mappable_command = MappableCommand::Typable {
+        name: cmd.name.to_string(),
+        args: String::new(),
+        doc: "".to_string(),
+    };
+
+    let mut ctx = Context {
+        register: None,
+        count: None,
+        editor: cx.editor,
+        callback: Vec::new(),
+        on_next_key_callback: None,
+        jobs: cx.jobs,
+    };
+
+    // // TODO: Figure this out?
+    helix_event::dispatch(crate::events::PostCommand {
+        command: &mappable_command,
+        cx: &mut ctx,
+    });
+
+    res
 }
 
 #[allow(clippy::unnecessary_unwrap)]
@@ -4176,8 +4448,15 @@ pub(super) fn command_mode(cx: &mut Context) {
 }
 
 fn command_line_doc(input: &str) -> Option<Cow<'_, str>> {
-    let (command, _, _) = command_line::split(input);
-    let command = TYPABLE_COMMAND_MAP.get(command)?;
+    let (command_name, _, _) = command_line::split(input);
+
+    if let Some(doc) = ScriptingEngine::get_doc_for_identifier(command_name).map(|x| x.into()) {
+        return Some(doc);
+    }
+
+    let command = TYPABLE_COMMAND_MAP.get(command_name);
+
+    let command = command?;
 
     if command.aliases.is_empty() && command.signature.flags.is_empty() {
         return Some(Cow::Borrowed(command.doc));
@@ -4253,7 +4532,10 @@ fn complete_command_line(editor: &Editor, input: &str) -> Vec<ui::prompt::Comple
     if complete_command {
         fuzzy_match(
             input,
-            TYPABLE_COMMAND_LIST.iter().map(|command| command.name),
+            TYPABLE_COMMAND_LIST
+                .iter()
+                .map(|command| Cow::from(command.name))
+                .chain(crate::commands::engine::ScriptingEngine::available_commands()),
             false,
         )
         .into_iter()
@@ -4531,24 +4813,6 @@ fn complete_expansion_kind(content: &str, offset: usize) -> Vec<ui::prompt::Comp
     .collect()
 }
 
-fn current_workspace(cx: &compositor::Context) -> std::path::PathBuf {
-    let (_, doc) = current_ref!(cx.editor);
-    doc.workspace_root().to_path_buf()
-}
-
-/// Whether the currently focused document's workspace is trusted for git operations (gix
-/// `Trust::Full`).
-fn doc_trust_full(editor: &helix_view::Editor) -> bool {
-    let (_, doc) = current_ref!(editor);
-    editor
-        .workspace_trust
-        .query(
-            doc.workspace_root(),
-            helix_loader::workspace_trust::TrustQuery::Git,
-        )
-        .is_trusted()
-}
-
 fn trust_workspace(
     cx: &mut compositor::Context,
     args: Args<'_>,
@@ -4558,16 +4822,15 @@ fn trust_workspace(
         return Ok(());
     }
 
-    let workspace = current_workspace(cx);
-    cx.editor.workspace_trust.trust(&workspace);
+    helix_loader::workspace_trust::WorkspaceTrust::load(false).trust_workspace();
 
     cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
-    // Restart any LSPs that didn't start because trust was missing.
+    // HACK
     lsp_restart(cx, args, event)
 }
 
 fn untrust_workspace(
-    cx: &mut compositor::Context,
+    _cx: &mut compositor::Context,
     _args: Args<'_>,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
@@ -4575,26 +4838,6 @@ fn untrust_workspace(
         return Ok(());
     }
 
-    let workspace = current_workspace(cx);
-    cx.editor.workspace_trust.untrust(&workspace);
-    // Drop any workspace overrides that were merged into the live editor config while trust was
-    // granted. Running LSPs are not stopped here (use `:lsp-stop` for that); this only handles
-    // in-memory config.
-    cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
-    Ok(())
-}
-
-fn exclude_workspace(
-    cx: &mut compositor::Context,
-    _args: Args<'_>,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let workspace = current_workspace(cx);
-    cx.editor.workspace_trust.exclude(&workspace);
-    cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
+    helix_loader::workspace_trust::WorkspaceTrust::load(false).untrust_workspace();
     Ok(())
 }

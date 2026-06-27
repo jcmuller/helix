@@ -12,19 +12,36 @@ homepage.workspace = true
 [dependencies]
 helix-core = { path = "../helix-core" }
 helix-event = { path = "../helix-event" }
+helix-stdx = { path = "../helix-stdx" }
 
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "parking_lot", "macros"] }
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "time",
+  "sync",
+  "parking_lot",
+  "macros",
+] }
 parking_lot.workspace = true
 arc-swap.workspace = true
 
-gix = { version = "0.84.0", features = ["attributes", "status", "max-performance", "sha1"], default-features = false, optional = true }
-imara-diff =  "0.2.0"
+gix = { version = "0.84.0", features = [
+  "attributes",
+  "blame",
+  "max-performance",
+  "parallel",
+  "sha1",
+  "status",
+], default-features = false, optional = true }
+imara-diff = "0.2.0"
 anyhow = "1"
-
 log = "0.4"
+memchr = { version = "2.7", optional = true }
+tempfile = { version = "3.13", optional = true }
 
 [features]
 git = ["gix"]
+jj = ["memchr", "tempfile"]
 
 [dev-dependencies]
 tempfile.workspace = true
