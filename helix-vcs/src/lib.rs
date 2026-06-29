@@ -88,7 +88,7 @@ impl DiffProviderRegistry {
 #[cfg_attr(not(any(feature = "git", feature = "jj")), allow(unused))]
 impl DiffProviderRegistry {
     /// Register a provider (if any is found) for the given path.
-    pub fn add(&mut self, path: &Path) {
+    pub fn add(&mut self, path: &Path, trust_full: bool) {
         let Some((repo_path, provider)) = get_possible_provider(path) else {
             // Do nothing here: there is no path to use and so the actual methods to get infos
             // like `get_diff_base` just won't do anything since they won't find a source to
@@ -107,7 +107,7 @@ impl DiffProviderRegistry {
             #[cfg(feature = "git")]
             PossibleDiffProvider::Git => self.add_file_git(repo_path),
             #[cfg(feature = "jj")]
-            PossibleDiffProvider::JJ => self.add_file_jj(repo_path),
+            PossibleDiffProvider::JJ => self.add_file_jj(repo_path, trust_full),
         };
 
         match result {
@@ -142,9 +142,9 @@ impl DiffProviderRegistry {
     }
 
     /// Reload the provider for the given path.
-    pub fn reload(&mut self, path: &Path) {
+    pub fn reload(&mut self, path: &Path, trust_full: bool) {
         self.remove(path);
-        self.add(path);
+        self.add(path, trust_full);
     }
 
     /// Remove the given path from the provider cache. If it was the last one using it, this will
@@ -208,7 +208,14 @@ impl DiffProviderRegistry {
 
     /// Add the JJ repo to the known providers *if* it isn't already known.
     #[cfg(feature = "jj")]
-    fn add_file_jj(&mut self, repo_path: &Path) -> Result<(Arc<Path>, PossibleDiffProvider)> {
+    fn add_file_jj(
+        &mut self,
+        repo_path: &Path,
+        trust_full: bool,
+    ) -> Result<(Arc<Path>, PossibleDiffProvider)> {
+        if !trust_full {
+            anyhow::bail!("jj diff provider requires full workspace trust");
+        }
         // Don't build a JJ repo object if there is already one for that path.
         if let Some((key, DiffProvider::JJ(_))) = self.providers.get_key_value(repo_path) {
             return Ok((Arc::clone(key), PossibleDiffProvider::JJ));

@@ -778,8 +778,6 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
     let modified_ids: Vec<_> = editor
         .documents()
         .filter(|doc| doc.is_modified())
-        // Named scratch documents should not be included here
-        .filter(|doc| doc.name.is_none())
         .map(|doc| doc.id())
         .collect();
 
@@ -811,6 +809,7 @@ pub struct WriteAllOptions {
     pub force: bool,
     pub write_scratch: bool,
     pub auto_format: bool,
+    pub code_actions: bool,
 }
 
 pub fn write_all_impl(
@@ -819,7 +818,6 @@ pub fn write_all_impl(
 ) -> anyhow::Result<()> {
     let mut errors: Vec<&'static str> = Vec::new();
     let config = cx.editor.config();
-    let jobs = &mut cx.jobs;
     let saves: Vec<_> = cx
         .editor
         .documents
@@ -832,13 +830,7 @@ pub fn write_all_impl(
             if !doc.is_modified() {
                 return None;
             }
-
-            // This is a named buffer. We'll skip it in the saves for now
-            if doc.name.is_some() {
-                return None;
-            }
-
-            if doc.path().is_none() && doc.name.is_none() {
+            if doc.path().is_none() {
                 if options.write_scratch {
                     errors.push("cannot write a buffer without a filename");
                 }
@@ -868,24 +860,53 @@ pub fn write_all_impl(
         // Save an undo checkpoint for any outstanding changes.
         doc.append_changes_to_history(view);
 
-        let fmt = if options.auto_format && config.auto_format {
-            let doc = doc!(cx.editor, &doc_id);
-            doc.auto_format(cx.editor).map(|fmt| {
-                let callback = make_format_callback(
-                    doc_id,
-                    doc.version(),
-                    target_view,
-                    fmt,
-                    Some((None, options.force)),
-                );
-                jobs.add(Job::with_callback(callback).wait_before_exiting());
-            })
+        let auto_format = config.auto_format && options.auto_format;
+        let force = options.force;
+
+        let run_code_actions = options.code_actions
+            && doc!(cx.editor, &doc_id)
+                .language_config()
+                .and_then(|c| c.code_actions_on_save.as_deref())
+                .is_some_and(|kinds| !kinds.is_empty());
+
+        // See `write_impl`: deferred format-or-save tail that always saves, only
+        // built when there is pre-save work; otherwise a synchronous save below.
+        let tail = (auto_format || run_code_actions).then(|| {
+            let callback: job::Callback = Callback::Followup(Box::new(move |editor| {
+                let doc = doc!(editor, &doc_id);
+                let fmt_job = auto_format
+                    .then(|| doc.auto_format(editor))
+                    .flatten()
+                    .map(|fmt| {
+                        let call = make_format_callback(
+                            doc_id,
+                            doc.version(),
+                            target_view,
+                            fmt,
+                            Some((None, force)),
+                        );
+                        Job::with_callback(call).wait_before_exiting()
+                    });
+                if fmt_job.is_none() {
+                    if let Err(err) = editor.save::<PathBuf>(doc_id, None, force) {
+                        editor.set_error(format!("Error saving: {}", err));
+                    }
+                }
+                fmt_job
+            }));
+            Job::with_callback(async { Ok(callback) }).wait_before_exiting()
+        });
+
+        let job = if run_code_actions {
+            code_actions_on_save(cx, doc_id, tail)
         } else {
-            None
+            tail
         };
 
-        if fmt.is_none() {
-            cx.editor.save::<PathBuf>(doc_id, None, options.force)?;
+        if let Some(job) = job {
+            cx.jobs.add(job);
+        } else {
+            cx.editor.save::<PathBuf>(doc_id, None, force)?;
         }
     }
 
@@ -907,6 +928,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
             force: false,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -926,6 +948,7 @@ fn force_write_all(
             force: true,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
 }
@@ -944,6 +967,7 @@ fn write_all_quit(
             force: false,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, false)
@@ -963,6 +987,7 @@ fn force_write_all_quit(
             force: true,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     );
     quit_all_impl(cx, true)
@@ -1519,10 +1544,19 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
     let scrolloff = cx.editor.config().scrolloff;
     let auto_fetch = cx.editor.config().inline_blame.auto_fetch;
+    let trust_full = {
+        let doc = doc!(cx.editor);
+        let ws_root = doc.workspace_root().to_path_buf();
+        cx.editor
+            .workspace_trust
+            .query(&ws_root, helix_loader::workspace_trust::TrustQuery::Git)
+            .is_trusted()
+    };
     let (view, doc) = current!(cx.editor);
-    doc.reload(view, &mut cx.editor.diff_providers).map(|_| {
-        view.ensure_cursor_in_view(doc, scrolloff);
-    })?;
+    doc.reload(view, &mut cx.editor.diff_providers, trust_full)
+        .map(|_| {
+            view.ensure_cursor_in_view(doc, scrolloff);
+        })?;
     let doc_id = doc.id();
     if let Some(path) = doc.path().map(ToOwned::to_owned) {
         cx.editor
@@ -1575,6 +1609,14 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
     cx.editor.diff_providers.reset();
 
     for (doc_id, view_ids) in docs_view_ids {
+        let trust_full = {
+            let doc = doc!(cx.editor, &doc_id);
+            let ws_root = doc.workspace_root().to_path_buf();
+            cx.editor
+                .workspace_trust
+                .query(&ws_root, helix_loader::workspace_trust::TrustQuery::Git)
+                .is_trusted()
+        };
         let doc = doc_mut!(cx.editor, &doc_id);
 
         // Every doc is guaranteed to have at least 1 view at this point.
@@ -1583,7 +1625,7 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        if let Err(error) = doc.reload(view, &mut cx.editor.diff_providers) {
+        if let Err(error) = doc.reload(view, &mut cx.editor.diff_providers, trust_full) {
             cx.editor.set_error(format!("{}", error));
             continue;
         }
@@ -3178,6 +3220,12 @@ const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
+const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
+    name: "no-code-actions",
+    doc: "skip code actions on save",
+    ..Flag::DEFAULT
+};
+
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
@@ -4349,38 +4397,10 @@ fn execute_command_line(
         return execute_command(cx, cmd, command, event);
     }
 
-    if event == PromptEvent::Validate {
-        let parts = rest.split_whitespace().collect::<Vec<_>>();
-        if ScriptingEngine::call_typed_command(cx, command, &parts, event) {
-            // Engine handles the other cases
-            let mappable_command = MappableCommand::Typable {
-                name: command.to_string(),
-                args: parts.join(" "),
-                doc: "".to_string(),
-            };
-
-            let mut ctx = Context {
-                register: None,
-                count: None,
-                editor: cx.editor,
-                callback: Vec::new(),
-                on_next_key_callback: None,
-                jobs: cx.jobs,
-            };
-
-            helix_event::dispatch(crate::events::PostCommand {
-                command: &mappable_command,
-                cx: &mut ctx,
-            });
-
-            Ok(())
-        } else if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(command) {
-            execute_command(cx, cmd, rest, event)
-        } else {
-            Err(anyhow!("1 no such command: '{command}'"))
-        }
-    } else if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(command) {
+    if let Some(cmd) = typed::TYPABLE_COMMAND_MAP.get(command) {
         execute_command(cx, cmd, rest, event)
+    } else if event == PromptEvent::Validate {
+        Err(anyhow!("1 no such command: '{command}'"))
     } else {
         Ok(())
     }
@@ -4449,10 +4469,6 @@ pub(super) fn command_mode(cx: &mut Context) {
 
 fn command_line_doc(input: &str) -> Option<Cow<'_, str>> {
     let (command_name, _, _) = command_line::split(input);
-
-    if let Some(doc) = ScriptingEngine::get_doc_for_identifier(command_name).map(|x| x.into()) {
-        return Some(doc);
-    }
 
     let command = TYPABLE_COMMAND_MAP.get(command_name);
 
@@ -4534,8 +4550,7 @@ fn complete_command_line(editor: &Editor, input: &str) -> Vec<ui::prompt::Comple
             input,
             TYPABLE_COMMAND_LIST
                 .iter()
-                .map(|command| Cow::from(command.name))
-                .chain(crate::commands::engine::ScriptingEngine::available_commands()),
+                .map(|command| Cow::from(command.name)),
             false,
         )
         .into_iter()
@@ -4822,15 +4837,15 @@ fn trust_workspace(
         return Ok(());
     }
 
-    helix_loader::workspace_trust::WorkspaceTrust::load(false).trust_workspace();
+    let workspace = doc!(cx.editor).workspace_root().to_path_buf();
+    cx.editor.workspace_trust.trust(&workspace);
 
     cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
-    // HACK
     lsp_restart(cx, args, event)
 }
 
 fn untrust_workspace(
-    _cx: &mut compositor::Context,
+    cx: &mut compositor::Context,
     _args: Args<'_>,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
@@ -4838,6 +4853,7 @@ fn untrust_workspace(
         return Ok(());
     }
 
-    helix_loader::workspace_trust::WorkspaceTrust::load(false).untrust_workspace();
+    let workspace = doc!(cx.editor).workspace_root().to_path_buf();
+    cx.editor.workspace_trust.untrust(&workspace);
     Ok(())
 }
